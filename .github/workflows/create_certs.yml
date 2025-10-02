@@ -3,27 +3,7 @@ run-name: Create Certificates (${{ github.ref_name }})
 
 on:
   workflow_call:
-    inputs:
-      nuke_now:
-        type: boolean
-        required: false
-        default: false
-      force_nuke:
-        type: boolean
-        required: false
-        default: false
   workflow_dispatch:
-    inputs:
-      nuke_now:
-        description: "Nuke if needed (one-off override)"
-        type: boolean
-        required: false
-        default: false
-      force_nuke:
-        description: "Force nuke regardless of status"
-        type: boolean
-        required: false
-        default: false
 
 env:
   TEAMID: ${{ secrets.TEAMID }}
@@ -45,12 +25,11 @@ jobs:
     runs-on: macos-15
     outputs:
       new_certificate_needed: ${{ steps.set_output.outputs.new_certificate_needed }}
-
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
-      # Patch Match tables (no sed parens/heredocs)
+      # Safe patch (no parens/heredocs)
       - name: Patch Match Tables (safe)
         shell: bash
         run: |
@@ -68,7 +47,11 @@ jobs:
         shell: bash
         run: bundle install
 
-      - name: Check and create or update Distribution certificate and profiles if needed
+      - name: Sync clock
+        shell: bash
+        run: sudo sntp -sS time.windows.com
+
+      - name: Check and create/update Distribution certificate and profiles if needed
         shell: bash
         run: |
           set -e
@@ -86,8 +69,7 @@ jobs:
         env:
           ENABLE_NUKE_CERTS: ${{ vars.ENABLE_NUKE_CERTS }}
           FORCE_NUKE_CERTS: ${{ vars.FORCE_NUKE_CERTS }}
-          NUKE_NOW: ${{ inputs.nuke_now }}
-          FORCE_NUKE: ${{ inputs.force_nuke }}
+          DISABLE_AUTO_NUKE: ${{ vars.DISABLE_AUTO_NUKE }}
         run: |
           set -e
           CERT_STATUS_FILE="$GITHUB_WORKSPACE/fastlane/new_certificate_needed.txt"
@@ -100,29 +82,22 @@ jobs:
           fi
           echo "new_certificate_needed=$CERT_STATUS" >> "$GITHUB_OUTPUT"
 
-          # If certs are OK, just inform about automation toggle and exit 0
-          if [ "$CERT_STATUS" != "true" ] && [ "${ENABLE_NUKE_CERTS:-}" != "true" ]; then
-            echo "::notice::🔔 Automated renewal (nuke) is disabled because ENABLE_NUKE_CERTS is not 'true'."
-            exit 0
+          # Guidance notices (no hard failure here)
+          if [ "$CERT_STATUS" != "true" ] && [ "${ENABLE_NUKE_CERTS:-}" != "true" ] && [ "${DISABLE_AUTO_NUKE:-}" = "true" ]; then
+            echo "::notice::🔔 Automated renewal is disabled (DISABLE_AUTO_NUKE=true)."
           fi
 
-          # If certs are bad:
-          if [ "$CERT_STATUS" = "true" ]; then
-            if [ "${FORCE_NUKE:-}" = "true" ] || [ "${FORCE_NUKE_CERTS:-}" = "true" ] || [ "${ENABLE_NUKE_CERTS:-}" = "true" ] || [ "${NUKE_NOW:-}" = "true" ]; then
-              echo "::notice::🧨 A nuke run is authorized (by repo vars or inputs). Proceeding to nuke job."
-              exit 0
-            else
-              echo "::error::❌ No valid distribution certificate found. Automated renewal was skipped because ENABLE_NUKE_CERTS is not 'true' (and no nuke override was provided)."
-              echo "::notice::Tip: Re-run with workflow input 'nuke_now=true', or set repo var ENABLE_NUKE_CERTS='true'."
-              exit 1
-            fi
+          if [ "$CERT_STATUS" = "true" ] && [ "${DISABLE_AUTO_NUKE:-}" = "true" ] && [ "${ENABLE_NUKE_CERTS:-}" != "true" ] && [ "${FORCE_NUKE_CERTS:-}" != "true" ]; then
+            echo "::notice::⚠️ A new certificate is needed but auto-nuke is disabled (DISABLE_AUTO_NUKE=true)."
           fi
+          # Never exit 1 here — let the nuke job decide.
 
   nuke_certs:
     name: Nuke certificates
     needs: [validate, create_certs]
     runs-on: macos-15
-    if: ${{ (needs.create_certs.outputs.new_certificate_needed == 'true' && (vars.ENABLE_NUKE_CERTS == 'true' || inputs.nuke_now == 'true')) || vars.FORCE_NUKE_CERTS == 'true' || inputs.force_nuke == 'true' }}
+    # Auto-nuke if needed unless explicitly disabled; also allow force var
+    if: ${{ (needs.create_certs.outputs.new_certificate_needed == 'true' && vars.DISABLE_AUTO_NUKE != 'true') || vars.FORCE_NUKE_CERTS == 'true' }}
     steps:
       - name: Output from step id 'check_certs'
         shell: bash
@@ -152,5 +127,5 @@ jobs:
         shell: bash
         run: |
           echo "::warning::⚠️ All Distribution certificates and TestFlight profiles have been revoked and recreated."
-          echo "::warning::❗️ If you have other apps that don't auto-renew, run this workflow for each of those apps."
+          echo "::warning::❗️ If you have other apps being distributed by GitHub Actions / Fastlane / TestFlight that do not renew automatically, run this workflow for each app."
           echo "::warning::✅ Existing TestFlight builds will keep working."

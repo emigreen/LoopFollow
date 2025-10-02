@@ -1,7 +1,9 @@
 name: 3. Create Certificates
 run-name: Create Certificates (${{ github.ref_name }})
 
-on: [workflow_call, workflow_dispatch]
+on:
+  workflow_call:
+  workflow_dispatch:
 
 env:
   TEAMID: ${{ secrets.TEAMID }}
@@ -9,7 +11,7 @@ env:
   MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
   FASTLANE_KEY_ID: ${{ secrets.FASTLANE_KEY_ID }}
   FASTLANE_ISSUER_ID: ${{ secrets.FASTLANE_ISSUER_ID }}
-  # FASTLANE_KEY/FASTLANE_KEY_BASE64 are handled in a step below
+  FASTLANE_KEY: ${{ secrets.FASTLANE_KEY }}
 
 jobs:
   validate:
@@ -28,75 +30,15 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
-      # Provide the ASC API key both as a file (FASTLANE_KEY_PATH) and as multiline env (FASTLANE_KEY)
-      - name: Prepare App Store Connect API key
-        shell: bash
-        env:
-          FASTLANE_KEY_BASE64: ${{ secrets.FASTLANE_KEY_BASE64 }}
-          FASTLANE_KEY_RAW: ${{ secrets.FASTLANE_KEY }}
-        run: |
-          set -e
-          if [ -n "${FASTLANE_KEY_BASE64:-}" ]; then
-            if echo "$FASTLANE_KEY_BASE64" | base64 --decode > asc_api_key.p8 2>/dev/null; then :
-            elif echo "$FASTLANE_KEY_BASE64" | base64 -d > asc_api_key.p8 2>/dev/null; then :
-            else
-              printf '%s' "$FASTLANE_KEY_BASE64" | base64 -D > asc_api_key.p8
-            fi
-          elif [ -n "${FASTLANE_KEY_RAW:-}" ]; then
-            # Keep exact PEM formatting
-            printf '%s' "$FASTLANE_KEY_RAW" > asc_api_key.p8
-          else
-            echo "::error::Provide FASTLANE_KEY_BASE64 (preferred) or FASTLANE_KEY (raw PEM) in repo secrets."
-            exit 1
-          fi
-          echo "FASTLANE_KEY_PATH=$PWD/asc_api_key.p8" >> "$GITHUB_ENV"
-          {
-            printf 'FASTLANE_KEY<<EOF\n'
-            cat asc_api_key.p8
-            printf '\nEOF\n'
-          } >> "$GITHUB_ENV"
-
-      - name: Validate ASC key inputs
-        shell: bash
-        env:
-          FASTLANE_KEY_ID: ${{ secrets.FASTLANE_KEY_ID }}
-          FASTLANE_ISSUER_ID: ${{ secrets.FASTLANE_ISSUER_ID }}
-          FASTLANE_KEY_PATH: ${{ env.FASTLANE_KEY_PATH }}
-        run: |
-          set -e
-          err=0
-          [ "${#FASTLANE_KEY_ID}" -eq 10 ] || { echo "::error::FASTLANE_KEY_ID should be 10 chars"; err=1; }
-          printf '%s' "$FASTLANE_ISSUER_ID" | grep -Eq '^[0-9a-fA-F-]{36}$' || { echo "::error::FASTLANE_ISSUER_ID should look like a UUID"; err=1; }
-          [ -f "$FASTLANE_KEY_PATH" ] || { echo "::error::FASTLANE_KEY_PATH not found"; err=1; }
-          head -n1 "$FASTLANE_KEY_PATH" | grep -q "BEGIN PRIVATE KEY" || { echo "::error::Key missing BEGIN header"; err=1; }
-          tail -n1 "$FASTLANE_KEY_PATH" | grep -q "END PRIVATE KEY"   || { echo "::error::Key missing END footer"; err=1; }
-          exit $err
-
-      # If your Fastfile reads Base64.strict_encode64("#{GITHUB_REPOSITORY_OWNER}:#{GH_PAT}"), make sure both envs exist
-      - name: Prepare Match git auth
-        shell: bash
-        env:
-          REPO_OWNER: ${{ github.repository_owner }}
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: |
-          set -e
-          AUTH="$(printf '%s' "${REPO_OWNER}:${GH_PAT}" | base64)"
-          echo "MATCH_GIT_BASIC_AUTHORIZATION=$AUTH" >> "$GITHUB_ENV"
-          echo "GITHUB_REPOSITORY_OWNER=${REPO_OWNER}" >> "$GITHUB_ENV"
-
-      # Patch Fastlane Match to not print tables (keeps logs quiet)
-      - name: Patch Match Tables
+      # Remove table-printing lines without using sed parens or heredocs
+      - name: Patch Match Tables (safe)
         shell: bash
         run: |
           set -e
-          TABLE_PRINTER_PATH=$(ruby -e 'puts Gem::Specification.find_by_name("fastlane").gem_dir')/match/lib/match/table_printer.rb
+          TABLE_PRINTER_PATH="$(ruby -e 'puts Gem::Specification.find_by_name("fastlane").gem_dir')/match/lib/match/table_printer.rb"
           if [ -f "$TABLE_PRINTER_PATH" ]; then
-            # Remove lines that render Terminal::Table
-            ruby - "$TABLE_PRINTER_PATH" <<'RB'
-              path = ARGV.first
-              lines = File.read(path).lines.reject { |l| l.include?('Terminal::Table.new(') }
-              File.write(path, lines.join)
-            RB
+            awk '!/Terminal::Table\.new\(/ {print}' "$TABLE_PRINTER_PATH" > "$TABLE_PRINTER_PATH.tmp"
+            mv "$TABLE_PRINTER_PATH.tmp" "$TABLE_PRINTER_PATH"
           else
             echo "table_printer.rb not found"
             exit 1
@@ -106,12 +48,12 @@ jobs:
         shell: bash
         run: bundle install
 
-      # Optional but helps with cert timestamps flakiness
+      # Optional but helps with timestamp issues on mac runners
       - name: Sync clock
         shell: bash
         run: sudo sntp -sS time.windows.com
 
-      - name: Check and create or update Distribution certificate and profiles if needed
+      - name: Check and create/update Distribution certificate and profiles if needed
         shell: bash
         run: |
           set -e
@@ -134,4 +76,61 @@ jobs:
           CERT_STATUS_FILE="$GITHUB_WORKSPACE/fastlane/new_certificate_needed.txt"
           CERT_STATUS="false"
           if [ -f "$CERT_STATUS_FILE" ]; then
-            CERT_S_
+            CERT_STATUS="$(tr -d '\r\n' < "$CERT_STATUS_FILE")"
+            echo "new_certificate_needed: $CERT_STATUS"
+          else
+            echo "Certificate status file not found. Defaulting to false."
+          fi
+
+          echo "new_certificate_needed=$CERT_STATUS" >> "$GITHUB_OUTPUT"
+
+          if [ "$CERT_STATUS" != "true" ] && [ "${ENABLE_NUKE_CERTS:-}" != "true" ]; then
+            echo "::notice::🔔 Automated renewal of certificates is disabled because ENABLE_NUKE_CERTS is not 'true'."
+          fi
+
+          if [ "$CERT_STATUS" = "true" ] && [ "${ENABLE_NUKE_CERTS:-}" != "true" ]; then
+            echo "::error::❌ No valid distribution certificate found. Automated renewal was skipped because ENABLE_NUKE_CERTS is not 'true'."
+            exit 1
+          fi
+
+          if [ "${FORCE_NUKE_CERTS:-}" = "true" ]; then
+            echo "::warning::‼️ Nuking of certificates was forced because FORCE_NUKE_CERTS is set to 'true'."
+          fi
+
+  # Nuke Certs if needed and enabled
+  nuke_certs:
+    name: Nuke certificates
+    needs: [validate, create_certs]
+    runs-on: macos-15
+    if: ${{ (needs.create_certs.outputs.new_certificate_needed == 'true' && vars.ENABLE_NUKE_CERTS == 'true') || vars.FORCE_NUKE_CERTS == 'true' }}
+    steps:
+      - name: Output from step id 'check_certs'
+        shell: bash
+        run: echo "new_certificate_needed=${{ needs.create_certs.outputs.new_certificate_needed }}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: bundle install
+
+      - name: Run Fastlane nuke_certs
+        shell: bash
+        run: |
+          set -e
+          bundle exec fastlane nuke_certs
+
+      - name: Recreate Distribution certificate after nuking
+        shell: bash
+        run: |
+          set -e
+          bundle exec fastlane certs
+
+      - name: Add success annotations for nuke and certificate recreation
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          echo "::warning::⚠️ All Distribution certificates and TestFlight profiles have been revoked and recreated."
+          echo "::warning::❗️ If you have other apps being distributed by GitHub Actions / Fastlane / TestFlight that do not renew certificates automatically, run the '3. Create Certificates' workflow for each of those apps."
+          echo "::warning::✅ Existing TestFlight builds will keep working."
